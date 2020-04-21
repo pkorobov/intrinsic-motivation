@@ -1,48 +1,54 @@
 import gym
-import math
-import random
-import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
 from itertools import count
 from dqn import DQN, ReplayMemory
-from curiosity import ForwardModel, InverseModel
-
+from curiosity import ForwardModel, InverseModel, ICMModel
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
-episodes = 10
-
-# env = gym.envs.make("CartPole-v0")
-env = gym.envs.make("MountainCar-v0")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import numpy as np
+import random
+import matplotlib.pyplot as plt
 
 BATCH_SIZE = 128
-GAMMA = 0.99
+GAMMA = 0.999
 EPS_START = 0.9
 EPS_END = 0.01
 EPS_DECAY = 5000
 TARGET_UPDATE = 10
+STEPS_DONE = 0
+ETA = 100.0
+LEARNING_STARTS = 2000
 
+
+def fix_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    random.seed(seed)
+
+
+env = gym.envs.make("MountainCar-v0")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 obs_dim = env.observation_space.shape[0]
 n_actions = env.action_space.n
 
-curiosity = ForwardModel(obs_dim, n_actions, device)
-# curiosity = InverseModel(obs_dim, n_actions, device)
+# curiosity = ForwardModel(obs_dim, n_actions, encode_states=True, device=device).to(device)
+# curiosity = InverseModel(obs_dim, n_actions, device, latent_state_dim=32, encode_states=True).to(device)
+curiosity = ICMModel(obs_dim, n_actions, latent_state_dim=32).to(device)
 
 policy_net = DQN(observation_dim=obs_dim, actions_number=n_actions, hidden_size=32).to(device)
 target_net = DQN(observation_dim=obs_dim, actions_number=n_actions, hidden_size=32).to(device)
 target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()
 
-optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-memory = ReplayMemory(capacity=100000)
-steps_done = 0
+policy_optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+curiosity_optimizer = optim.Adam(curiosity.parameters(), lr=1e-3)
 
-episode_durations = []
+memory = ReplayMemory(capacity=10000)
+
 
 def optimize_model():
     if len(memory) < BATCH_SIZE:
@@ -50,68 +56,71 @@ def optimize_model():
 
     state, action, next_state, reward, not_done = memory.sample(BATCH_SIZE)
 
+    loss = curiosity.loss(state, next_state, action)
+    curiosity_optimizer.zero_grad()
+    loss.backward()
+    curiosity_optimizer.step()
+
+    if STEPS_DONE < LEARNING_STARTS:
+        return
+
     state_action_values = policy_net(state).gather(1, action.view(-1, 1))
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
-    next_state_values[not_done] = target_net(next_state[not_done]).max(1)[0].detach()
-    # next_state_values = target_net(next_state).max(1)[0].detach()
-    expected_state_action_values = reward + next_state_values * GAMMA
-
-    # action_ohe = torch.zeros(len(action), n_actions, device=device).scatter_(1, action.unsqueeze(1), 1)
+    next_state_values[not_done] = target_net(next_state[not_done]).max(1)[0]
+    expected_state_action_values = reward + next_state_values.detach() * GAMMA
     loss = F.mse_loss(state_action_values, expected_state_action_values.unsqueeze(1))
 
-    optimizer.zero_grad()
+    policy_optimizer.zero_grad()
     loss.backward()
-    optimizer.step()
-
-    curiosity.update(state, next_state, action)
-
-    # curiosity.update(state, next_state, action_ohe)
+    policy_optimizer.step()
 
 
 num_episodes = 500
+cum_e_reward, cum_i_reward = 0, 0
+flag_achieved = 0
+fix_seed(0)
+episode_rewards = []
 
-cum_reward = 0
-cum_i_reward = 0
 for i_episode in range(num_episodes):
     state = env.reset()
-
-    i_weight = 10
 
     for t in count():
         env.render()
 
-        eps = EPS_END + (EPS_START - EPS_END) * \
-              math.exp(-1. * steps_done / EPS_DECAY)
-        steps_done += 1
+        eps = EPS_END + (EPS_START - EPS_END) * 10.0 ** (-STEPS_DONE / EPS_DECAY)
+        STEPS_DONE += 1
 
         action = policy_net.act(state, eps)
-        next_state, reward, done, _ = env.step(action.item())
-        cum_reward += reward
+        next_state, e_reward, done, _ = env.step(action.item())
+        i_reward = curiosity.reward(state, next_state, action.item()) * ETA
 
-        action_ohe = torch.zeros(len(action), n_actions, device=device).scatter_(1, action, 1)
-        i_reward = curiosity.intrinsic_reward(state, next_state, action)
-
+        cum_e_reward += e_reward
         cum_i_reward += i_reward
 
-        memory.add(state, action, next_state, reward + i_reward * i_weight, 1 - done)
+        if STEPS_DONE < LEARNING_STARTS:
+            i_reward = 0
+
+        memory.add(state, action.item(), next_state, e_reward + i_reward, 1 - done)
         state = next_state
         optimize_model()
 
         if done:
-            episode_durations.append(t + 1)
+            print(f"Extrinsic and intrinsic rewards for the episode {i_episode}: {cum_e_reward, cum_i_reward}")
+            if cum_e_reward > -200.0:
+                flag_achieved += 1
+            episode_rewards.append(cum_e_reward)
+            cum_e_reward, cum_i_reward = 0, 0
             break
-
-    print("__________________________")
-    print(cum_reward, cum_i_reward * i_weight)
-    print("__________________________")
-
-    cum_reward = 0
-    cum_i_reward = 0
 
     if i_episode % TARGET_UPDATE == 0:
         target_net.load_state_dict(policy_net.state_dict())
 
-print('Complete')
-
 env.render()
 env.close()
+
+print(f"Flag was achieved in {flag_achieved} pf {num_episodes}")
+
+plt.figure(figsize=(12, 8))
+plt.plot(episode_rewards)
+plt.show()
+plt.savefig("episode_rewards.svg")
