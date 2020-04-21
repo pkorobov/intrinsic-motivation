@@ -20,17 +20,20 @@ ETA = 100.0
 LEARNING_STARTS = 2000
 
 
-def fix_seed(seed):
+def fix_seed(seed, env):
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
+    env.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    random.seed(seed)
 
 
 env = gym.envs.make("MountainCar-v0")
+fix_seed(0, env)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 obs_dim = env.observation_space.shape[0]
 n_actions = env.action_space.n
@@ -39,8 +42,8 @@ n_actions = env.action_space.n
 # curiosity = InverseModel(obs_dim, n_actions, device, latent_state_dim=32, encode_states=True).to(device)
 curiosity = ICMModel(obs_dim, n_actions, latent_state_dim=32).to(device)
 
-policy_net = DQN(observation_dim=obs_dim, actions_number=n_actions, hidden_size=32).to(device)
-target_net = DQN(observation_dim=obs_dim, actions_number=n_actions, hidden_size=32).to(device)
+policy_net = DQN(observation_dim=obs_dim, n_actions=n_actions, hidden_size=32).to(device)
+target_net = DQN(observation_dim=obs_dim, n_actions=n_actions, hidden_size=32).to(device)
 target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()
 
@@ -78,7 +81,6 @@ def optimize_model():
 num_episodes = 500
 cum_e_reward, cum_i_reward = 0, 0
 flag_achieved = 0
-fix_seed(0)
 episode_rewards = []
 
 for i_episode in range(num_episodes):
@@ -90,9 +92,9 @@ for i_episode in range(num_episodes):
         eps = EPS_END + (EPS_START - EPS_END) * 10.0 ** (-STEPS_DONE / EPS_DECAY)
         STEPS_DONE += 1
 
-        action = policy_net.act(state, eps)
-        next_state, e_reward, done, _ = env.step(action.item())
-        i_reward = curiosity.reward(state, next_state, action.item()) * ETA
+        action = policy_net.act(state, eps).item()
+        next_state, e_reward, done, _ = env.step(action)
+        i_reward = curiosity.reward(state, next_state, action) * ETA
 
         cum_e_reward += e_reward
         cum_i_reward += i_reward
@@ -100,14 +102,12 @@ for i_episode in range(num_episodes):
         if STEPS_DONE < LEARNING_STARTS:
             i_reward = 0
 
-        memory.add(state, action.item(), next_state, e_reward + i_reward, 1 - done)
+        memory.add(state, action, next_state, e_reward + i_reward, 1 - done)
         state = next_state
         optimize_model()
 
         if done:
             print(f"Extrinsic and intrinsic rewards for the episode {i_episode}: {cum_e_reward, cum_i_reward}")
-            if cum_e_reward > -200.0:
-                flag_achieved += 1
             episode_rewards.append(cum_e_reward)
             cum_e_reward, cum_i_reward = 0, 0
             break
@@ -118,9 +118,13 @@ for i_episode in range(num_episodes):
 env.render()
 env.close()
 
-print(f"Flag was achieved in {flag_achieved} pf {num_episodes}")
+episode_rewards = np.array(episode_rewards)
+print(f"Flag was achieved in {(episode_rewards[-100:] > -200).sum()} of last {100} episodes")
+print(f"Average reward is {episode_rewards[-100:].mean()} for last {100} episodes")
 
 plt.figure(figsize=(12, 8))
 plt.plot(episode_rewards)
+plt.xlabel("Episode number")
+plt.ylabel("Reward")
 plt.show()
-plt.savefig("episode_rewards.svg")
+plt.savefig("episode_rewards.pdf")
