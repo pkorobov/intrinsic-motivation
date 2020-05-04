@@ -5,13 +5,15 @@ import torch.nn as nn
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def network_block(input_dim, output_dim, hidden_dim=32):
-    block = nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, output_dim))
+def network_block(input_dim, output_dim, hidden_dim=32, mid_layers=1):
+    layers = list()
+    layers.append(nn.Linear(input_dim, hidden_dim))
+    layers.append(nn.ReLU())
+    for i in range(mid_layers):
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(nn.ReLU())
+    layers.append(nn.Linear(hidden_dim, output_dim))
+    block = nn.Sequential(*layers)
     return block
 
 
@@ -22,7 +24,7 @@ class ForwardModel(nn.Module):
         super(ForwardModel, self).__init__()
 
         if encode_states:
-            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=8)
+            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
             self.action_embedding = nn.Embedding(n_actions, action_embedding_dim)
             self.head = network_block(latent_state_dim + action_embedding_dim, latent_state_dim)
         else:
@@ -34,7 +36,6 @@ class ForwardModel(nn.Module):
         self.encode_states = encode_states
 
     def forward(self, state, action):
-
         if self.encode_states:
             state_emb = self.encoder(state)
         else:
@@ -44,7 +45,6 @@ class ForwardModel(nn.Module):
         return self.head(torch.cat([state_emb, action_emb], dim=-1))
 
     def loss(self, state, next_state, action):
-
         if not (torch.is_tensor(state) and torch.is_tensor(next_state) and torch.is_tensor(action)):
             state = torch.tensor(state, dtype=torch.float, device=device)
             next_state = torch.tensor(next_state, dtype=torch.float, device=device)
@@ -59,14 +59,13 @@ class ForwardModel(nn.Module):
 
 
 class InverseModel(nn.Module):
-
     def __init__(self, state_dim, n_actions, encode_states=False,
                  latent_state_dim=8, action_embedding_dim=8, hidden_dim=16):
 
         super(InverseModel, self).__init__()
 
         if encode_states:
-            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=8)
+            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
             self.head = network_block(2 * latent_state_dim, n_actions)
         else:
             self.head = network_block(2 * state_dim, n_actions)
@@ -86,7 +85,6 @@ class InverseModel(nn.Module):
         return self.head(torch.cat([state_emb, next_state_emb], dim=-1))
 
     def loss(self, state, next_state, action):
-
         if not (torch.is_tensor(state) and torch.is_tensor(next_state) and torch.is_tensor(action)):
             state = torch.tensor(state, dtype=torch.float, device=device)
             next_state = torch.tensor(next_state, dtype=torch.float, device=device)
@@ -104,7 +102,8 @@ class ICMModel(nn.Module):
                  hidden_dim=8, eta=1.0):
 
         super(ICMModel, self).__init__()
-        self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=8)
+
+        self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
         self.forward_model = ForwardModel(latent_state_dim, n_actions)
         self.inverse_model = InverseModel(latent_state_dim, n_actions)
         self.eta = eta
@@ -137,3 +136,25 @@ class ICMModel(nn.Module):
             next_state = torch.tensor(next_state, dtype=torch.float, device=device)
             action = torch.tensor(action, dtype=torch.long, device=device)
         return float(self.forward(state, next_state, action)[0])
+
+
+class RND(nn.Module):
+
+    def __init__(self, state_dim, output_dim=8, hidden_dim=32):
+
+        super(RND, self).__init__()
+
+        self.target = network_block(state_dim, output_dim, hidden_dim)
+        self.predictor = network_block(state_dim, output_dim, hidden_dim)
+        for param in self.target.parameters():
+            param.requires_grad = False
+
+    def loss(self, next_state):
+        if not torch.is_tensor(next_state):
+            next_state = torch.tensor(next_state, dtype=torch.float, device=device)
+        pred = self.predictor(next_state)
+        target = self.target(next_state)
+        return 0.5 * (pred - target).pow(2).sum()
+
+    def reward(self, next_state):
+        return float(self.loss(next_state))
