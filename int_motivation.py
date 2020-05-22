@@ -5,7 +5,7 @@ import torch.nn as nn
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def network_block(input_dim, output_dim, hidden_dim=32, mid_layers=1):
+def network_block(input_dim, output_dim, hidden_dim=32, mid_layers=0):
     layers = list()
     layers.append(nn.Linear(input_dim, hidden_dim))
     layers.append(nn.ReLU())
@@ -18,7 +18,7 @@ def network_block(input_dim, output_dim, hidden_dim=32, mid_layers=1):
 
 
 class ForwardModel(nn.Module):
-    def __init__(self, state_dim, n_actions, device=None, encode_states=False,
+    def __init__(self, state_dim, n_actions, encode_states=False,
                  latent_state_dim=8, action_embedding_dim=8, hidden_dim=16):
 
         super(ForwardModel, self).__init__()
@@ -70,7 +70,7 @@ class InverseModel(nn.Module):
         else:
             self.head = network_block(2 * state_dim, n_actions)
 
-        self.head.add_module('softmax', nn.Softmax())
+        self.head.add_module('softmax', nn.Softmax(dim=-1))
         self.n_actions = n_actions
         self.encode_states = encode_states
 

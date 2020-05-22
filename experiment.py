@@ -1,6 +1,7 @@
 import gym
 from itertools import count
-from qr_dqn import QuantileRegressionDQN, ReplayMemory, huber
+from qr_dqn import QuantileRegressionDQN
+from utils import ReplayMemory, huber
 from int_motivation import ForwardModel, InverseModel, ICMModel, RND
 import torch
 import torch.optim as optim
@@ -9,11 +10,12 @@ import numpy as np
 import random
 import matplotlib.pyplot as plt
 import argparse
-
+import os
+import copy
 
 GAMMA = 0.99
-EPS_START = 0.9
-EPS_END = 0.1
+EPS_START = 1.0
+EPS_END = 0.01
 EPS_DECAY = 500
 TARGET_UPDATE = 100
 
@@ -37,11 +39,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--memory_size', default=100000, type=int)
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--num_episodes', default=501, type=int)
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--num_episodes', default=801, type=int)
+    parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--eta', default=1.0, type=float)
     parser.add_argument('--learning_starts', default=2000, type=int)
     parser.add_argument('--int_motivation_type', default=None, type=str)
+    parser.add_argument('--output_dir', default="results", type=str)
+    parser.add_argument('--hidden_size', default=256, type=int)
+    parser.add_argument('--num_quant', default=5, type=int)
+    parser.add_argument('--render', default=False, type=bool)
+    parser.add_argument('--print', default=False, type=bool)
+
+    # TODO: add flag for state normalization
+    # TODO: add flag for separation of returns
     args = parser.parse_args()
 
     env = gym.envs.make("MountainCar-v0")
@@ -53,40 +63,45 @@ if __name__ == '__main__':
     if args.int_motivation_type == 'ICM':
         intrinsic_motivation = ICMModel(obs_dim, n_actions, latent_state_dim=32).to(device)
     if args.int_motivation_type == 'Forward':
-        intrinsic_motivation = ForwardModel(obs_dim, n_actions, encode_states=True, device=device).to(device)
+        intrinsic_motivation = ForwardModel(obs_dim, n_actions, encode_states=True).to(device)
     if args.int_motivation_type == 'Inverse':
-        intrinsic_motivation = InverseModel(obs_dim, n_actions, device, latent_state_dim=32, encode_states=True).to(device)
+        intrinsic_motivation = InverseModel(obs_dim, n_actions, encode_states=True).to(device)
     if args.int_motivation_type == 'RND':
         intrinsic_motivation = RND(obs_dim).to(device)
 
+    Z_net = QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions,
+                                  hidden_size=args.hidden_size, num_quant=args.num_quant).to(device)
+    Z_target_net = copy.deepcopy(Z_net)
+    # QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions).to(device)
+    Z_target_net.load_state_dict(Z_net.state_dict())
+    Z_target_net.eval()
 
-    policy_net = QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions).to(device)
-    target_net = QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions).to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    intrinsic_motivation_optimizer = optim.Adam(intrinsic_motivation.parameters(), lr=1e-3) \
+    policy_optimizer = optim.Adam(Z_net.parameters(), lr=1e-3)
+    intrinsic_motivation_optimizer = optim.Adam(intrinsic_motivation.parameters(), lr=1e-4) \
         if intrinsic_motivation is not None else None
 
     memory = ReplayMemory(capacity=args.memory_size)
 
-    eps = lambda steps: EPS_END + (EPS_START - EPS_END) * np.exp(-1. * steps / EPS_DECAY)
+    def eps(episode_number):
+        return max(EPS_END, EPS_START * 0.9 ** episode_number)
 
-    tau = torch.Tensor((2 * np.arange(policy_net.num_quant) + 1) / (2.0 * policy_net.num_quant)).view(1, -1)
+    tau = torch.Tensor((2 * np.arange(Z_net.num_quant) + 1) / (2.0 * Z_net.num_quant)).view(1, -1).to(device)
     flag_achieved = 0
     episode_rewards = []
+    episode_int_rewards = []
 
     steps_done = 0
     for episode in range(args.num_episodes):
         sum_ext_reward, sum_int_reward = 0, 0
         state = env.reset()
+
         for t in count():
-            env.render()
+            if args.render:
+                env.render()
 
             steps_done += 1
 
-            action = policy_net.act(torch.Tensor([state]), eps(steps_done))
+            action = Z_net.act(torch.Tensor([state]).to(device), eps(episode))
             next_state, ext_reward, done, _ = env.step(action)
             sum_ext_reward += ext_reward
 
@@ -113,12 +128,12 @@ if __name__ == '__main__':
 
                 # the main algorithm training
                 if steps_done >= args.learning_starts:
-                    theta = policy_net(states)[np.arange(args.batch_size), actions]
-                    Znext = target_net(next_states).detach()
-                    Znext_max = Znext[np.arange(args.batch_size), Znext.mean(2).max(1)[1]]
-                    Ttheta = rewards + GAMMA * (1 - dones) * Znext_max
+                    theta = Z_net(states)[np.arange(args.batch_size), actions]
+                    Z_next = Z_target_net(next_states).detach()
+                    Z_next_max = Z_next[np.arange(args.batch_size), Z_next.mean(2).max(1)[1]]
+                    T_theta = rewards + GAMMA * (1 - dones) * Z_next_max
 
-                    diff = Ttheta.t().unsqueeze(-1) - theta
+                    diff = T_theta.t().unsqueeze(-1) - theta
                     loss = huber(diff) * (tau - (diff.detach() < 0).float()).abs()
                     loss = loss.mean()
 
@@ -128,17 +143,25 @@ if __name__ == '__main__':
             state = next_state
 
             if steps_done % TARGET_UPDATE == 0:
-                target_net.load_state_dict(policy_net.state_dict())
+                Z_target_net.load_state_dict(Z_net.state_dict())
 
             if done:
-                print(f"Extrinsic and intrinsic rewards for the episode {episode}: {sum_ext_reward, sum_int_reward}")
+                if args.print:
+                    print(f"Extrinsic and intrinsic rewards for the episode {episode}: {sum_ext_reward, sum_int_reward}")
                 episode_rewards.append(sum_ext_reward)
+                episode_int_rewards.append(sum_int_reward)
                 break
 
-    env.render()
+    if args.render:
+        env.render()
     env.close()
 
     episode_rewards = np.array(episode_rewards)
+    episode_int_rewards = np.array(episode_int_rewards)
+
+    os.makedirs(f"{args.output_dir}", exist_ok=True)
+    np.save(f"{args.output_dir}/{args.int_motivation_type}_{args.seed}", episode_rewards)
+    np.save(f"{args.output_dir}/{args.int_motivation_type}_int_{args.seed}", episode_int_rewards)
     print(f"Flag was achieved in {(episode_rewards[-100:] > -200).sum()} of last {100} episodes")
     print(f"Average reward for last {100} episodes is {episode_rewards[-100:].mean()}")
 
@@ -147,4 +170,4 @@ if __name__ == '__main__':
     plt.xlabel("Episode number")
     plt.ylabel("Reward")
     plt.show()
-    fig.savefig("episode_rewards.pdf")
+    fig.savefig(f"{args.output_dir}/{args.int_motivation_type}_{args.seed}.png")
