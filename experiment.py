@@ -1,13 +1,11 @@
 import gym
 from itertools import count
 from qr_dqn import QuantileRegressionDQN
-from utils import ReplayMemory, huber
+from utils import ReplayMemory, huber, fix_seed, RunningMeanStd
 from int_motivation import ForwardModel, InverseModel, ICMModel, RND
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
-import random
 import matplotlib.pyplot as plt
 import argparse
 import os
@@ -18,17 +16,6 @@ EPS_START = 1.0
 EPS_END = 0.01
 EPS_DECAY = 500
 TARGET_UPDATE = 100
-
-
-def fix_seed(seed, env):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    env.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_quant', default=5, type=int)
     parser.add_argument('--render', default=False, type=bool)
     parser.add_argument('--print', default=False, type=bool)
-
+    parser.add_argument('--normalize_int_reward', default=False, type=bool)
     # TODO: add flag for state normalization
     # TODO: add flag for separation of returns
     args = parser.parse_args()
@@ -58,6 +45,9 @@ if __name__ == '__main__':
     fix_seed(args.seed, env)
     obs_dim = env.observation_space.shape[0]
     n_actions = env.action_space.n
+
+    int_reward_rms = RunningMeanStd()
+    state_rms = RunningMeanStd(shape=(obs_dim,))
 
     intrinsic_motivation = None
     if args.int_motivation_type == 'ICM':
@@ -72,12 +62,10 @@ if __name__ == '__main__':
     Z_net = QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions,
                                   hidden_size=args.hidden_size, num_quant=args.num_quant).to(device)
     Z_target_net = copy.deepcopy(Z_net)
-    # QuantileRegressionDQN(observation_dim=obs_dim, n_actions=n_actions).to(device)
-    Z_target_net.load_state_dict(Z_net.state_dict())
     Z_target_net.eval()
 
     policy_optimizer = optim.Adam(Z_net.parameters(), lr=1e-3)
-    intrinsic_motivation_optimizer = optim.Adam(intrinsic_motivation.parameters(), lr=1e-4) \
+    intrinsic_motivation_optimizer = optim.Adam(intrinsic_motivation.parameters(), lr=1e-3) \
         if intrinsic_motivation is not None else None
 
     memory = ReplayMemory(capacity=args.memory_size)
@@ -106,32 +94,31 @@ if __name__ == '__main__':
             sum_ext_reward += ext_reward
 
             if intrinsic_motivation is not None:
-                # int_reward = np.clip(intrinsic_motivation.reward(state, next_state, action), 0, 10)
-                int_reward = intrinsic_motivation.reward(state, next_state, action) if args.int_motivation_type != "RND" \
-                                  else intrinsic_motivation.reward(next_state)
-                reward = int_reward * args.eta + ext_reward
-                sum_int_reward += int_reward * args.eta
+                if args.int_motivation_type != "RND":
+                    int_reward = intrinsic_motivation.reward(state, next_state, action)
+                else:
+                    int_reward = intrinsic_motivation.reward(next_state)
+                sum_int_reward += int_reward
             else:
-                reward = ext_reward
-            memory.push(state, action, next_state, reward, float(done))
+                int_reward = 0.
+            memory.push(state, action, next_state, ext_reward, int_reward, float(done))
 
             if len(memory) >= args.batch_size:
-                states, actions, next_states, rewards, dones = memory.sample(args.batch_size)
+                states, actions, next_states, ext_rewards, int_rewards, dones = memory.sample(args.batch_size)
 
-                # intrinsic motivation training
-                if intrinsic_motivation is not None:
-                    loss = intrinsic_motivation.loss(state, next_state, action) if args.int_motivation_type != "RND" \
-                                else intrinsic_motivation.loss(next_state)
-                    intrinsic_motivation_optimizer.zero_grad()
-                    loss.backward()
-                    intrinsic_motivation_optimizer.step()
+                if args.normalize_int_reward:
+                    int_reward_rms.update(int_rewards.cpu().numpy())
+                    int_rewards /= torch.from_numpy(np.sqrt(int_reward_rms.var)).to(device)
+
+                if steps_done == args.learning_starts:
+                    memory.clear()
 
                 # the main algorithm training
                 if steps_done >= args.learning_starts:
                     theta = Z_net(states)[np.arange(args.batch_size), actions]
                     Z_next = Z_target_net(next_states).detach()
                     Z_next_max = Z_next[np.arange(args.batch_size), Z_next.mean(2).max(1)[1]]
-                    T_theta = rewards + GAMMA * (1 - dones) * Z_next_max
+                    T_theta = (ext_rewards + args.eta * int_rewards) + GAMMA * (1 - dones) * Z_next_max
 
                     diff = T_theta.t().unsqueeze(-1) - theta
                     loss = huber(diff) * (tau - (diff.detach() < 0).float()).abs()
@@ -140,6 +127,16 @@ if __name__ == '__main__':
                     policy_optimizer.zero_grad()
                     loss.backward()
                     policy_optimizer.step()
+                elif args.int_motivation_type == 'RND' and args.state_normalization:
+                    state_rms.update(next_states.cpu().numpy())
+
+                # intrinsic motivation training
+                if intrinsic_motivation is not None:
+                    loss = intrinsic_motivation.loss(states, next_states, actions) if args.int_motivation_type != "RND" \
+                                else intrinsic_motivation.loss(next_states)
+                    intrinsic_motivation_optimizer.zero_grad()
+                    loss.backward()
+                    intrinsic_motivation_optimizer.step()
             state = next_state
 
             if steps_done % TARGET_UPDATE == 0:

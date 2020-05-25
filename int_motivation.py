@@ -19,12 +19,12 @@ def network_block(input_dim, output_dim, hidden_dim=32, mid_layers=0):
 
 class ForwardModel(nn.Module):
     def __init__(self, state_dim, n_actions, encode_states=False,
-                 latent_state_dim=8, action_embedding_dim=8, hidden_dim=16):
+                 latent_state_dim=64, action_embedding_dim=64):
 
         super(ForwardModel, self).__init__()
 
         if encode_states:
-            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
+            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=256)
             self.action_embedding = nn.Embedding(n_actions, action_embedding_dim)
             self.head = network_block(latent_state_dim + action_embedding_dim, latent_state_dim)
         else:
@@ -59,18 +59,15 @@ class ForwardModel(nn.Module):
 
 
 class InverseModel(nn.Module):
-    def __init__(self, state_dim, n_actions, encode_states=False,
-                 latent_state_dim=8, action_embedding_dim=8, hidden_dim=16):
+    def __init__(self, state_dim, n_actions, encode_states=False, latent_state_dim=64):
 
         super(InverseModel, self).__init__()
 
         if encode_states:
-            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
+            self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=256)
             self.head = network_block(2 * latent_state_dim, n_actions)
         else:
             self.head = network_block(2 * state_dim, n_actions)
-
-        self.head.add_module('softmax', nn.Softmax(dim=-1))
         self.n_actions = n_actions
         self.encode_states = encode_states
 
@@ -81,7 +78,6 @@ class InverseModel(nn.Module):
         else:
             state_emb = state
             next_state_emb = next_state
-
         return self.head(torch.cat([state_emb, next_state_emb], dim=-1))
 
     def loss(self, state, next_state, action):
@@ -89,7 +85,6 @@ class InverseModel(nn.Module):
             state = torch.tensor(state, dtype=torch.float, device=device)
             next_state = torch.tensor(next_state, dtype=torch.float, device=device)
             action = torch.tensor(action, dtype=torch.long, device=device)
-
         predicted_action = self.forward(state, next_state)
         return nn.CrossEntropyLoss()(predicted_action.view(-1, self.n_actions), action.view(-1))
 
@@ -98,12 +93,11 @@ class InverseModel(nn.Module):
 
 
 class ICMModel(nn.Module):
-    def __init__(self, state_dim, n_actions, latent_state_dim=8,
-                 hidden_dim=8, eta=1.0):
+    def __init__(self, state_dim, n_actions, latent_state_dim=64, eta=1.0):
 
         super(ICMModel, self).__init__()
 
-        self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=32)
+        self.encoder = network_block(state_dim, latent_state_dim, hidden_dim=256)
         self.forward_model = ForwardModel(latent_state_dim, n_actions)
         self.inverse_model = InverseModel(latent_state_dim, n_actions)
         self.eta = eta
@@ -120,7 +114,7 @@ class ICMModel(nn.Module):
         predicted_next_state = self.forward_model(state_emb, action)
         loss2 = 0.5 * (predicted_next_state - next_state_emb).pow(2).sum()
 
-        loss = loss1 + loss2
+        loss = loss1 + self.eta * loss2
         return loss2, loss
 
     def loss(self, state, next_state, action):
@@ -140,7 +134,7 @@ class ICMModel(nn.Module):
 
 class RND(nn.Module):
 
-    def __init__(self, state_dim, output_dim=8, hidden_dim=32):
+    def __init__(self, state_dim, output_dim=8, hidden_dim=256):
 
         super(RND, self).__init__()
 
