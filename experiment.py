@@ -37,8 +37,6 @@ if __name__ == '__main__':
     parser.add_argument('--render', default=False, type=bool)
     parser.add_argument('--print', default=False, type=bool)
     parser.add_argument('--normalize_int_reward', default=False, type=bool)
-    # TODO: add flag for state normalization
-    # TODO: add flag for separation of returns
     args = parser.parse_args()
 
     env = gym.envs.make("MountainCar-v0")
@@ -47,11 +45,10 @@ if __name__ == '__main__':
     n_actions = env.action_space.n
 
     int_reward_rms = RunningMeanStd()
-    state_rms = RunningMeanStd(shape=(obs_dim,))
 
     intrinsic_motivation = None
     if args.int_motivation_type == 'ICM':
-        intrinsic_motivation = ICMModel(obs_dim, n_actions, latent_state_dim=32).to(device)
+        intrinsic_motivation = ICMModel(obs_dim, n_actions).to(device)
     if args.int_motivation_type == 'Forward':
         intrinsic_motivation = ForwardModel(obs_dim, n_actions, encode_states=True).to(device)
     if args.int_motivation_type == 'Inverse':
@@ -127,8 +124,6 @@ if __name__ == '__main__':
                     policy_optimizer.zero_grad()
                     loss.backward()
                     policy_optimizer.step()
-                elif args.int_motivation_type == 'RND' and args.state_normalization:
-                    state_rms.update(next_states.cpu().numpy())
 
                 # intrinsic motivation training
                 if intrinsic_motivation is not None:
@@ -157,6 +152,7 @@ if __name__ == '__main__':
     episode_int_rewards = np.array(episode_int_rewards)
 
     os.makedirs(f"{args.output_dir}", exist_ok=True)
+    torch.save(Z_net.state_dict(), f"{args.output_dir}/QR_DQN_{args.int_motivation_type}_{args.seed}_weights")
     np.save(f"{args.output_dir}/{args.int_motivation_type}_{args.seed}", episode_rewards)
     np.save(f"{args.output_dir}/{args.int_motivation_type}_int_{args.seed}", episode_int_rewards)
     print(f"Flag was achieved in {(episode_rewards[-100:] > -200).sum()} of last {100} episodes")
@@ -166,5 +162,4 @@ if __name__ == '__main__':
     plt.plot(episode_rewards)
     plt.xlabel("Episode number")
     plt.ylabel("Reward")
-    plt.show()
     fig.savefig(f"{args.output_dir}/{args.int_motivation_type}_{args.seed}.png")
