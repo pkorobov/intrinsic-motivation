@@ -1,5 +1,10 @@
 # Intrinsic motivation
-Comparative study of intrinsic motivations  on the MountainCar-v0 environment
+Comparative study of intrinsic motivations on the MountainCar-v0 environment with QR-DQN as a base algorithm
+
+| Pure QR-DQN | Forward Dynamics | Inverse Dynamics | ICM | RND |
+| --- | --- | --- | --- | --- |
+| <img src='pics/pure_qr_dqn.gif' style="width: 200px;"/> | <img src='pics/forward.gif' style="width: 200px;"/> | <img src='pics/inverse.gif' style="width: 200px;"/> | <img src='pics/ICM.gif' style="width: 200px;"/> | <img src='pics/RND.gif' style="width: 200px;"/> |
+
 
 ##### Related papers: 
 
